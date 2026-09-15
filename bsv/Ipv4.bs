@@ -1,0 +1,73 @@
+package Ipv4 where
+
+-- IPv4 转发要算的东西，都是没有时序的函数：头部结构（RFC 791 3.1）、反码加（RFC 1071）、
+-- 校验和增量更新（RFC 1624 Eqn. 3）、头部五项检查（RFC 1812 5.2.2），以及路由表项怎么算
+-- 命中（RFC 1812 5.2.4.3 的 Basic Match，秩是前缀长度，于是 best 挑出来的就是 Longest Match）。
+
+import Match
+
+-- 前 20 字节，网络字节序：结构体打包时第一个字段在最高位，与线上先到的字节对齐
+struct Ipv4Hdr =
+    version :: Bit 4
+    ihl     :: Bit 4
+    tos     :: Bit 8
+    total   :: Bit 16
+    ident   :: Bit 16
+    frag    :: Bit 16
+    ttl     :: Bit 8
+    proto   :: Bit 8
+    csum    :: Bit 16
+    src     :: Bit 32
+    dst     :: Bit 32
+  deriving (Bits, Eq)
+
+-- 16 位反码加：进位绕回最低位。两个 16 位数之和最大 0x1FFFE，绕回一次不会再进位
+onesAdd :: Bit 16 -> Bit 16 -> Bit 16
+onesAdd a b =
+  let s :: Bit 17
+      s = zeroExtend a + zeroExtend b
+  in  s[15:0] + zeroExtend s[16:16]
+
+-- RFC 1624 Eqn. 3：HC' = ~(~HC + ~m + m')。不用 Eqn. 2（HC + m + ~m'），它在结果为 0 时给 0xFFFF
+ckUpdateEqn :: Bit 16 -> Bit 16 -> Bit 16 -> Bit 16
+ckUpdateEqn hc m m' = invert (onesAdd (onesAdd (invert hc) (invert m)) m')
+
+-- RFC 1624 第 4 节的例子：其余字节的反码和 0xCD7A，m = 0x5555 时 HC = 0xDD2F；m 变成 0x3285，HC' = 0x0000
+rfc1624Example :: Bool
+rfc1624Example = invert (onesAdd 0xCD7A 0x5555) == 0xDD2F && ckUpdateEqn 0xDD2F 0x5555 0x3285 == 0x0000
+
+-- 引擎从这里取增量更新：公式与 RFC 的例子对不上就不让编
+ckUpdate :: Bit 16 -> Bit 16 -> Bit 16 -> Bit 16
+ckUpdate hc m m' = if rfc1624Example then ckUpdateEqn hc m m'
+                   else error "Ipv4: the incremental checksum update does not reproduce the RFC 1624 example"
+
+-- RFC 1812 5.2.2 的五项：n 是链路层给的 IP 部分字节数，s 是头部（含校验和字段）的反码和。
+-- 另加一项头部要装得下：IHL×4 超过收到的字节数时，s 本来就只算了一部分
+headerOk :: UInt 11 -> Ipv4Hdr -> Bit 16 -> Bool
+headerOk n h s =
+  let hlen :: UInt 11
+      hlen = unpack (zeroExtend h.ihl) * 4
+      total :: UInt 16
+      total = unpack h.total
+  in  n >= 20 && s == 0xFFFF && h.version == 4 && h.ihl >= 5 && total >= zeroExtend hlen && hlen <= n
+
+struct Route =
+    prefix :: Bit 32
+    len    :: UInt 6
+    port   :: UInt 4
+    nh     :: Bit 48
+    valid  :: Bool
+  deriving (Bits, Eq)
+
+prefixMask :: UInt 6 -> Bit 32
+prefixMask l =
+  let ones :: Bit 32
+      ones = invert 0
+      sh :: UInt 7
+      sh = 32 - zeroExtend l
+  in  if l == 0 then 0 else ones << sh
+
+-- 目的地址的高 len 位与表项前缀相等就命中（Basic Match），秩是前缀长度（Longest Match）
+instance Match Route (Bit 32) where
+    matches r a = r.valid && r.len <= 32 && ((r.prefix ^ a) & prefixMask r.len) == 0
+    rank r = zeroExtend r.len

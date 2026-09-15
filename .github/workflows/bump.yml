@@ -1,0 +1,11 @@
+name: bump
+on:
+  schedule:
+    - cron: "17 3 1,16 * *"
+  workflow_dispatch:
+jobs:
+  bump:
+    uses: Tape-Out/.github/.github/workflows/bump.yml@main
+    permissions:
+      contents: write
+      pull-requests: write

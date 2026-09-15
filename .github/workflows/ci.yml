@@ -1,0 +1,7 @@
+name: ci
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  ip:
+    uses: Tape-Out/.github/.github/workflows/ip.yml@main
+    permissions:
+      contents: write

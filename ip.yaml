@@ -1,0 +1,156 @@
+name: erouter
+version: 0.1.0
+spec: '0.1'
+kind: ip
+lang:
+- bsv
+- bh
+identity:
+  slug: erouter-tapeout-bsv
+  display_name: IPv4 router
+  summary: Store-and-forward IPv4 router over RMII ports with RFC 1812 header 
+    checks, TTL, incremental checksum and a longest-prefix route table.
+  category: network
+  subcategories:
+  - ethernet
+  - router
+  ip_family: erouter
+  integration_profile:
+  - apb4-slave
+  maturity: simulated
+contract:
+  version: 1
+  ctrl:
+    shape: flat
+    aw: 12
+    dw: 32
+params:
+  ports:
+    type: int
+    default: 4
+    range:
+    - 2
+    - 4
+    desc: 端口数
+  routes:
+    type: int
+    default: 8
+    range:
+    - 2
+    - 16
+    desc: 路由表项数。每项一组寄存器加一个前缀比较器，挑最长的是一棵平衡树
+  mtu:
+    type: int
+    default: 256
+    range:
+    - 64
+    - 512
+    # 帧缓冲是触发器，每字节约 90 µm²（sram 实测每 32 位字 361）：4 口 1522 字节约 55 万 µm²，比整颗 soc-linux 还大。
+    # 整帧 1518 字节要等 SRAM 宏的实现，这一版上限取 512
+    desc: 每口帧缓冲的字节数（不含 FCS）。存储转发，放不下的帧丢弃
+emit:
+- kind: bsv
+  package: Erouter
+  module: mkErouter
+  config_type: ErouterCfg
+  interface: ErouterIfc
+  ctrl: regs
+  pins:
+  - name: pins
+    type: ErouterPins
+    targs:
+    - ports
+- kind: verilog-flat
+  bus: apb4
+deps:
+  hwcore: ^0.1
+  amba: ^0.1
+  emac: ^0.1
+area:
+  base:
+    per: ports
+    points:
+      '2': 93733.92
+      '4': 213109.68
+  params:
+    routes:
+      points:
+        '2': -13594.56
+        '8': 0.0
+        '16': 18384.24
+    mtu:
+      points:
+        '64': -112538.44
+        '256': 0.0
+        '512': 147855.4
+  margin: 0.003
+  model: points-additive
+  error:
+    bound: 0.003
+    sign: over
+    note: first measured by ran recal --init at the range ends and the default 
+      of each parameter; the margin is the worst underestimate at 5 off-grid 
+      probes
+  measured:
+  - at:
+      ports: 2
+      routes: 8
+      mtu: 256
+    um2: 93733.92
+  - at:
+      ports: 4
+      routes: 8
+      mtu: 256
+    um2: 213109.68
+  - at:
+      ports: 4
+      routes: 2
+      mtu: 256
+    um2: 199515.12
+  - at:
+      ports: 4
+      routes: 16
+      mtu: 256
+    um2: 231493.92
+  - at:
+      ports: 4
+      routes: 8
+      mtu: 64
+    um2: 100571.24
+  - at:
+      ports: 4
+      routes: 8
+      mtu: 512
+    um2: 360965.08
+  - at:
+      ports: 3
+      routes: 8
+      mtu: 256
+    um2: 148677.76
+  - at:
+      ports: 4
+      routes: 5
+      mtu: 256
+    um2: 206290.28
+  - at:
+      ports: 4
+      routes: 12
+      mtu: 256
+    um2: 221889.64
+  - at:
+      ports: 4
+      routes: 8
+      mtu: 160
+    um2: 157219.72
+  - at:
+      ports: 4
+      routes: 8
+      mtu: 384
+    um2: 286790.0
+  corner:
+    tool: ecc
+    pdk: ics55
+    freq_mhz: 100
+    measured: '2026-09-16'
+    toolchain: bsc 2026.01 · yosys 0.68+195 · ecc 0.1.0a11
+    gen_digest: sha256:93726053f9eb1c17

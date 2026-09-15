@@ -1,0 +1,87 @@
+ip: erouter
+contract: { aw: 12, dw: 32 }
+base: 0x10016000
+size: 0x1000
+params: [ports, routes]
+
+regs:
+  - name: ctrl
+    offset: 0x00
+    desc: control
+    fields:
+      - { name: en, bits: "0:0", sw: rw, hw: r, reset: 0 }
+
+  # 每口一个 MAC 地址：高 16 位与低 32 位，先到线上的字节在最高位
+  - name: machi
+    offset: 0x010
+    desc: port MAC address, high 16 bits
+    array: { count: ports, stride: 8 }
+    fields: [ { name: val, bits: "15:0", sw: rw, hw: r, reset: 0 } ]
+
+  - name: maclo
+    offset: 0x014
+    desc: port MAC address, low 32 bits
+    array: { count: ports, stride: 8 }
+    fields: [ { name: val, width: 32, sw: rw, hw: r, reset: 0 } ]
+
+  - name: rprefix
+    offset: 0x100
+    desc: route destination prefix
+    array: { count: routes, stride: 16 }
+    fields: [ { name: val, width: 32, sw: rw, hw: r, reset: 0 } ]
+
+  # len 5:0 前缀长度 · port 11:8 出口 · valid 15。数组寄存器只用单字段，位在引擎里拆
+  - name: rcfg
+    offset: 0x104
+    desc: route prefix length, output port and valid bit
+    array: { count: routes, stride: 16 }
+    fields: [ { name: val, bits: "15:0", sw: rw, hw: r, reset: 0 } ]
+
+  - name: rnhhi
+    offset: 0x108
+    desc: route next hop MAC address, high 16 bits
+    array: { count: routes, stride: 16 }
+    fields: [ { name: val, bits: "15:0", sw: rw, hw: r, reset: 0 } ]
+
+  - name: rnhlo
+    offset: 0x10C
+    desc: route next hop MAC address, low 32 bits
+    array: { count: routes, stride: 16 }
+    fields: [ { name: val, width: 32, sw: rw, hw: r, reset: 0 } ]
+
+  - name: rxcnt
+    offset: 0x400
+    desc: frames received
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: fwdcnt
+    offset: 0x404
+    desc: packets forwarded
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: fcscnt
+    offset: 0x408
+    desc: frames dropped for a bad FCS or a receive error
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: l2cnt
+    offset: 0x40C
+    desc: frames dropped for another destination MAC or a type other than IPv4
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: hdrcnt
+    offset: 0x410
+    desc: packets dropped by the RFC 1812 header checks
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: ttlcnt
+    offset: 0x414
+    desc: packets dropped because the TTL ran out
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: routecnt
+    offset: 0x418
+    desc: packets dropped for no matching route
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: longcnt
+    offset: 0x41C
+    desc: frames dropped for not fitting the frame buffer
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+  - name: busycnt
+    offset: 0x420
+    desc: frames dropped because the port still held an unsent packet
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
