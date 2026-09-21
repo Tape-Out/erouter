@@ -376,7 +376,7 @@ import RmiiTx::*;
 import RmiiRx::*;
 import Erouter::*;
 
-// 由 tb/mkeroutertb.py 生成，勿手改。
+// 由 htest/mkeroutertb.py 生成，勿手改。
 // 这一点：ports={P} routes={R} mtu={M}
 
 typedef struct {{
