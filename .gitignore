@@ -1,3 +1,11 @@
 .*
 !.git*
 build/
+*.lock
+!xirang.lock
+*.bo
+*.ba
+*.vcd
+*.fst
+__pycache__/
+dist/
