@@ -26,7 +26,7 @@ P = int(k.get("ports", 4))
 R = int(k.get("routes", 8))
 M = int(k.get("mtu", 256))
 
-H = 40          # 帧的前 H 字节查表，之后的字节按 pat 公式，长帧不必整帧进表
+H = 44          # 帧的前 H 字节查表，之后的字节按 pat 公式，长帧不必整帧进表
 HOST = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55]
 NH = {"A": [0x02, 0xAA, 0x00, 0x00, 0x00, 0x0A],
       "B": [0x02, 0xAA, 0x00, 0x00, 0x00, 0x0B],
@@ -121,11 +121,49 @@ def forwarded(f, o, nh):
     return b
 
 
+def be4(v):
+    return [(v >> s) & 0xFF for s in (24, 16, 8, 0)]
+
+
+def portip(p):
+    return ip4(10, 9, p, 1)
+
+
+def arpreq(port, sha, spa, tpa, op=1, dmac=None):
+    """一个 60 字节的 ARP 帧（RFC 826），垫充照 pat 取，与帧表的约定一致。"""
+    f = len(FR)
+    b = [pat(f, i) for i in range(60)]
+    b[0:6] = [0xFF] * 6 if dmac is None else dmac
+    b[6:12] = sha
+    b[12:14] = [0x08, 0x06]
+    b[14:22] = [0, 1, 8, 0, 6, 4, 0, op]
+    b[22:28] = sha
+    b[28:32] = be4(spa)
+    b[32:38] = [0] * 6
+    b[38:42] = be4(tpa)
+    FR.append(b)
+    return f
+
+
+def arpreply(f, o):
+    b = list(FR[f])
+    sha, spa = b[22:28], b[28:32]
+    b[0:6] = sha
+    b[6:12] = mac(o)
+    b[21] = 2
+    b[22:28] = mac(o)
+    b[28:32] = be4(portip(o))
+    b[32:38] = sha
+    b[38:42] = spa
+    return b
+
+
 def sig(b):
     return len(b) + 4, int.from_bytes(zlib.crc32(bytes(b)).to_bytes(4, "little"), "big")
 
 
-COUNTERS = ["rxcnt", "fwdcnt", "fcscnt", "l2cnt", "hdrcnt", "ttlcnt", "routecnt", "longcnt", "busycnt"]
+COUNTERS = ["rxcnt", "fwdcnt", "fcscnt", "l2cnt", "hdrcnt", "ttlcnt", "routecnt", "longcnt", "busycnt",
+            "arpcnt"]
 ADDR = {c: 0x400 + 4 * i for i, c in enumerate(COUNTERS)}
 CNT = {c: 0 for c in COUNTERS}
 EXP = [[] for _ in range(P)]
@@ -315,6 +353,26 @@ CNT["rxcnt"] += 2
 CNT["fwdcnt"] += 1
 CNT["busycnt"] += 1
 EXP[OA].append(sig(forwarded(f1, OA, "A")))
+check()
+
+# 11：ARP（RFC 826）。问本口 IP 的请求从原口答回，改写成应答；问别的地址、已经是应答、本口没配 IP，
+# 都当链路层的帧丢。广播与发给本口 MAC 的两种请求都要答
+case = "arp"
+for p in range(P):
+    W(0x080 + 4 * p, portip(p) if p != LAST or P == 1 else 0)
+D(10)
+PC = [0x02, 0xC0, 0xFF, 0xEE, 0x00, 0x01]
+for dm, o in ((None, 0), (mac(0), 0)):
+    fr = arpreq(o, PC, ip4(10, 9, 0, 77), portip(o), dmac=dm)
+    S(o, fr)
+    settle(fr)
+    CNT["rxcnt"] += 1
+    CNT["arpcnt"] += 1
+    EXP[o].append(sig(arpreply(fr, o)))
+drop(0, arpreq(0, PC, ip4(10, 9, 0, 77), ip4(10, 9, 0, 9)), "l2cnt")
+drop(0, arpreq(0, PC, ip4(10, 9, 0, 77), portip(0), op=2), "l2cnt")
+if P > 1:
+    drop(LAST, arpreq(LAST, PC, ip4(10, 9, LAST, 77), portip(LAST)), "l2cnt")
 check()
 
 OPS.append((7, 0, 0, None))

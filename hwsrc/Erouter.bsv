@@ -6,6 +6,9 @@ package Erouter;
 //
 // 不做直通：RmiiTx 会给转出去的帧重算一个正确的 FCS，直通就把输入端的坏帧洗成了好帧。
 // 同 eswitch：一条规则只调一次某个动作方法；入口、出口、计数各自一条规则，互相用线递消息。
+//
+// 问本口 IP 的 ARP 请求就地答：请求留在入口的缓冲里，出口从原口发回时按位置改写成应答
+// （RFC 826）。主机要先解析网关的 MAC 才发得出第一个包，不答 ARP 就得在每台主机上手写静态表。
 
 import Vector::*;
 import GetPut::*;
@@ -38,10 +41,12 @@ typedef struct {
   UInt#(11) flen;
   Bit#(8)   ttl;
   Bit#(16)  csum;
+  Bool      arp;     // 是 ARP 应答：nh 是请求方的 MAC，spa 是它的 IP
+  Bit#(32)  spa;
 } Pending deriving (Bits);
 
 // 一帧的去向，同时也是计数器的编号。构造子名避开 RmiiTx、RmiiRx 状态枚举里的 Idle、Fcs 等
-typedef enum { Taken, Routed, BadFcs, NotMine, BadHdr, Expired, NoRoute, TooLong, Busy } Why deriving (Bits, Eq);
+typedef enum { Taken, Routed, BadFcs, NotMine, BadHdr, Expired, NoRoute, TooLong, Busy, Answered } Why deriving (Bits, Eq);
 
 function RmiiTxPins getTxPins(RmiiTxIfc i) = i.pins;
 function RmiiRxPins getRxPins(RmiiRxIfc i) = i.pins;
@@ -62,9 +67,9 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
 
   // ---- 每个入口的收帧状态 ----
   Vector#(ports, Reg#(UInt#(11)))   len     <- replicateM(mkReg(0));
-  // 前 34 字节（以太网 14 + IPv4 20）按位置落格，不移位：不足 34 字节的帧移位会错开，
+  // 前 42 字节（以太网 14 + IPv4 20，或 ARP 28）按位置落格，不移位：不足的帧移位会错开，
   // 本该判「IP 部分不足 20 字节」的帧就被当成目的 MAC 不对
-  Vector#(ports, Vector#(34, Reg#(Bit#(8)))) hv <- replicateM(replicateM(mkReg(0)));
+  Vector#(ports, Vector#(42, Reg#(Bit#(8)))) hv <- replicateM(replicateM(mkReg(0)));
   Vector#(ports, Reg#(Bit#(16)))    sum     <- replicateM(mkReg(0));
   Vector#(ports, Reg#(Bit#(8)))     hiB     <- replicateM(mkReg(0));
   Vector#(ports, Reg#(Bit#(4)))     ihl     <- replicateM(mkReg(0));
@@ -80,8 +85,10 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
 
   // 出口 q 发完入口 p 的包：每对一根脉冲线，谁也不跟谁抢写
   Vector#(ports, Vector#(ports, PulseWire)) done <- replicateM(replicateM(mkPulseWire));
+  // ARP 应答也从出口发完，但它不是转发的包，fwdcnt 不记它
+  Vector#(ports, Vector#(ports, PulseWire)) fwd  <- replicateM(replicateM(mkPulseWire));
   Vector#(ports, RWire#(Why))               ev   <- replicateM(mkRWire);
-  Vector#(9, Reg#(Bit#(32)))                cnt  <- replicateM(mkReg(0));
+  Vector#(10, Reg#(Bit#(32)))               cnt  <- replicateM(mkReg(0));
 
   function Bit#(48) macOf(Integer p) = {r.machi[p], r.maclo[p]};
 
@@ -103,7 +110,7 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
         if (!sk) begin
           if (len[p] < fromInteger(cap)) buff[p].upd(len[p], c.dat);
           else tooLong[p] <= True;
-          if (len[p] < 34) hv[p][len[p]] <= c.dat;
+          if (len[p] < 42) hv[p][len[p]] <= c.dat;
           // IP 头部的反码和，边收边算（RFC 1071）；IHL 在 IP 部分第一个字节里
           if (len[p] >= 14) begin
             UInt#(11) i = len[p] - 14;
@@ -120,16 +127,25 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
       end else begin
         // 帧尾：去掉 4 字节 FCS 再判
         UInt#(11) flen = len[p] < 4 ? 0 : len[p] - 4;
-        Bit#(272) hb   = pack(reverse(readVReg(hv[p])));
-        Bit#(48)  dmac = hb[271:224];
-        Bit#(16)  etyp = hb[175:160];
-        Ipv4Hdr   ip   = unpack(hb[159:0]);
+        Bit#(336) hb   = pack(reverse(readVReg(hv[p])));
+        Bit#(48)  dmac = hb[335:288];
+        Bit#(16)  etyp = hb[239:224];
+        Ipv4Hdr   ip   = unpack(hb[223:64]);
+        // ARP 请求（RFC 826）：以太网、IPv4、6 与 4 字节地址、op 1，问的是本口的 IP。本口没配 IP 不答
+        Bool arpAsk = flen >= 42 && etyp == 16'h0806 && (dmac == '1 || dmac == macOf(p))
+                      && hb[223:176] == 48'h000108000604 && hb[175:160] == 1
+                      && r.ipaddr[p] != 0 && hb[31:0] == r.ipaddr[p];
         Maybe#(UInt#(TLog#(routes))) hit = best(table_, ip.dst);
         Why why = Taken;
         Maybe#(Pending) np = tagged Invalid;
         if (skip[p]) why = Busy;
         else if (!c.fcsOk || len[p] < 4) why = BadFcs;
         else if (tooLong[p]) why = TooLong;
+        else if (arpAsk) begin
+          why = Answered;
+          np = tagged Valid Pending { out: fromInteger(p), nh: hb[159:112], flen: flen, ttl: 0,
+                                      csum: 0, arp: True, spa: hb[111:80] };
+        end
         else if (flen < 14 || etyp != 16'h0800 || dmac != macOf(p)) why = NotMine;
         else if (!headerOk(flen - 14, ip, sum[p])) why = BadHdr;
         // TTL 减一之后为 0 就丢（RFC 1812 5.3.1）；ICMP Time Exceeded 不发
@@ -139,7 +155,8 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
           Bit#(8) nt = ip.ttl - 1;
           // RFC 1624 Eqn. 3：变的只有 TTL 与 Protocol 那一个 16 位字
           np = tagged Valid Pending { out: rt.port, nh: rt.nh, flen: flen, ttl: nt,
-                                      csum: ckUpdate(ip.csum, {ip.ttl, ip.proto}, {nt, ip.proto}) };
+                                      csum: ckUpdate(ip.csum, {ip.ttl, ip.proto}, {nt, ip.proto}),
+                                      arp: False, spa: 0 };
         end else why = NoRoute;
         if (isValid(np)) pend[p][1] <= np;
         ev[p].wset(why);
@@ -165,13 +182,25 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
         Pending t = fromMaybe(?, pv[p]);
         Vector#(6, Bit#(8)) nh  = unpack(t.nh);
         Vector#(6, Bit#(8)) own = unpack(macOf(q));
+        Vector#(4, Bit#(8)) oip = unpack(r.ipaddr[q]);
+        Vector#(4, Bit#(8)) spa = unpack(t.spa);
         Bit#(8) b = bv[p];
-        Bit#(8) o = k < 6 ? nh[5 - k] : (k < 12 ? own[11 - k] : (k == 22 ? t.ttl :
-                    (k == 24 ? t.csum[15:8] : (k == 25 ? t.csum[7:0] : b))));
+        Bit#(8) o = k < 6 ? nh[5 - k] : (k < 12 ? own[11 - k] : b);
+        if (!t.arp)
+          o = k == 22 ? t.ttl : (k == 24 ? t.csum[15:8] : (k == 25 ? t.csum[7:0] : o));
+        // 应答：op 改 2，发送方写本口，目标写请求方
+        else if (k == 21) o = 2;
+        else if (k >= 22 && k < 28) o = own[27 - k];
+        else if (k >= 28 && k < 32) o = oip[31 - k];
+        else if (k >= 32 && k < 38) o = nh[37 - k];
+        else if (k >= 38 && k < 42) o = spa[41 - k];
         txp[q].tx.put(tuple2(o, k + 1 == t.flen));
         if (k + 1 == t.flen) begin
           cur[q] <= tagged Invalid;
-          for (Integer i = 0; i < nport; i = i + 1) if (p == fromInteger(i)) done[q][i].send;
+          for (Integer i = 0; i < nport; i = i + 1) if (p == fromInteger(i)) begin
+            done[q][i].send;
+            if (!t.arp) fwd[q][i].send;
+          end
         end else at[q] <= k + 1;
       end else begin
         // 轮转挑一个挂到本口的入口
@@ -194,11 +223,11 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
   // 计数：同一拍几个口各报一件事，按去向加起来。局部向量只能按编译期下标改，所以外层按去向展开、
   // 里层数有几个口报了它（按运行时的去向去改 add[pack(w)]，bsc 求不出下标，G0013）
   rule count;
-    for (Integer i = 0; i < 9; i = i + 1) begin
+    for (Integer i = 0; i < 10; i = i + 1) begin
       UInt#(4) n = 0;
       for (Integer p = 0; p < nport; p = p + 1) begin
         if (ev[p].wget matches tagged Valid .w &&& (i == 0 || pack(w) == fromInteger(i))) n = n + 1;
-        if (i == 1) for (Integer q = 0; q < nport; q = q + 1) if (done[q][p]) n = n + 1;
+        if (i == 1) for (Integer q = 0; q < nport; q = q + 1) if (fwd[q][p]) n = n + 1;
       end
       cnt[i] <= cnt[i] + zeroExtend(pack(n));
     end
@@ -214,6 +243,7 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
     r.routecnt_in(cnt[pack(NoRoute)]);
     r.longcnt_in(cnt[pack(TooLong)]);
     r.busycnt_in(cnt[pack(Busy)]);
+    r.arpcnt_in(cnt[pack(Answered)]);
   endrule
 
   interface regs = r.regs;

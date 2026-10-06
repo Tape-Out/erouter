@@ -17,6 +17,8 @@ It is store-and-forward: each input keeps one frame in a buffer of `mtu` bytes a
 
 A frame is accepted when its destination MAC is the input port's address and its EtherType is 0x0800. The header then goes through the five checks of RFC 1812 section 5.2.2, which cannot be switched off, plus a check that the header fits in the frame. A packet whose TTL is 0 or 1 is dropped; otherwise the TTL is decremented and the header checksum updated with RFC 1624 equation 3. The route table is searched for the longest matching prefix (RFC 1812 section 5.2.4.3); on a tie the lower entry wins. The output port rewrites the destination MAC to the route's next hop and the source MAC to its own address. Every dropped frame is counted by reason.
 
+An ARP request (RFC 826) for the IPv4 address written into the input port's `ipaddr` is answered from that port, so a host can resolve its gateway. The request stays in the frame buffer and the output rewrites it into the reply as it sends: opcode 2, the port's MAC and address as sender, the asker as target. A port whose `ipaddr` is 0 answers nothing. The router sends no ARP request of its own.
+
 `hwcore/Match.bs` holds the table search in Bluespec Haskell: a `Match` class with two instances, exact keys for `Cam` and prefixes for routes, and one balanced-tree `best` that picks the matching entry of highest rank. `Ipv4.bs` holds the header layout, the one's complement sum, the incremental update and the header checks; at compile time it checks the update against the example in RFC 1624 section 4, and the build stops if they disagree. `Erouter.bsv` is the per-port receive, decide and transmit engine.
 
 The testbench drives every port with an `RmiiTx` and watches every port with an `RmiiRx`. It builds each frame in Python and computes the expected output independently, recomputing the whole checksum rather than updating it. Output frames are compared by length and FCS, which the device's own transmitter computes over the bytes it actually sent. It checks:
@@ -31,7 +33,8 @@ The testbench drives every port with an `RmiiTx` and watches every port with an 
 - two ports sending to the same output at once;
 - a packet whose updated checksum must be 0x0000, which equation 2 of RFC 1624 would give as 0xFFFF;
 - a frame of exactly `mtu` bytes forwarded and one byte more dropped;
-- a frame arriving while its port still holds an unsent packet, dropped and counted.
+- a frame arriving while its port still holds an unsent packet, dropped and counted;
+- an ARP request for a port's address, sent to the broadcast address and to the port's own MAC, each answered from that port and compared with a reply built independently; a request for another address, an ARP reply, and a request on a port with no address, each dropped and counted as a link-layer drop.
 
 ## Registers
 
@@ -40,6 +43,7 @@ The testbench drives every port with an `RmiiTx` and watches every port with an 
 | 0x000 | `ctrl` | `en` |
 | 0x010 + 8·p | `machi[p]` | MAC address of port p, high 16 bits |
 | 0x014 + 8·p | `maclo[p]` | MAC address of port p, low 32 bits |
+| 0x080 + 4·p | `ipaddr[p]` | IPv4 address of port p, answered in ARP; 0 answers nothing |
 | 0x100 + 16·i | `rprefix[i]` | route destination prefix |
 | 0x104 + 16·i | `rcfg[i]` | prefix length (5:0), output port (11:8), valid (15) |
 | 0x108 + 16·i | `rnhhi[i]` | next hop MAC, high 16 bits |
@@ -53,6 +57,7 @@ The testbench drives every port with an `RmiiTx` and watches every port with an 
 | 0x418 | `routecnt` | dropped: no matching route |
 | 0x41C | `longcnt` | dropped: frame longer than the buffer |
 | 0x420 | `busycnt` | dropped: the port still held an unsent packet |
+| 0x424 | `arpcnt` | ARP requests answered; not counted in `fwdcnt` |
 
 A MAC address is written with its first byte on the wire in the highest bits.
 
@@ -64,7 +69,7 @@ A MAC address is written with its first byte on the wire in the highest bits.
 | `routes` | 8 | 2–16 | route table entries |
 | `mtu` | 256 | 64–512 | frame buffer per port in bytes, FCS not included |
 
-Not implemented: ICMP (Time Exceeded, Destination Unreachable, Parameter Problem), ARP (next hop MACs are written into the route table), an address of the router's own and local delivery, fragmentation and per-port MTUs, IP options processing such as source routing, multicast and broadcast forwarding, IPv6, VLANs, routing by type of service, and output queues. Buffers are flip-flops, at roughly 90 µm² a byte, so `mtu` stops at 512: four full-size 1518-byte buffers would be larger than a whole reference SoC and need an SRAM macro instead.
+Not implemented: ICMP (Time Exceeded, Destination Unreachable, Parameter Problem), ARP resolution (requests for a port's address are answered, but the router sends none, so next hop MACs are written into the route table), local delivery to the router's own addresses (it does not answer ping), fragmentation and per-port MTUs, IP options processing such as source routing, multicast and broadcast forwarding, IPv6, VLANs, routing by type of service, and output queues. Buffers are flip-flops, at roughly 90 µm² a byte, so `mtu` stops at 512: four full-size 1518-byte buffers would be larger than a whole reference SoC and need an SRAM macro instead.
 
 ## Specification sources
 

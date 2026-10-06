@@ -24,6 +24,13 @@ regs:
     array: { count: ports, stride: 8 }
     fields: [ { name: val, width: 32, sw: rw, hw: r, reset: 0 } ]
 
+  # 本口的 IPv4 地址：问它的 ARP 请求就地应答。写 0 表示本口不答
+  - name: ipaddr
+    offset: 0x080
+    desc: port IPv4 address, answered in ARP
+    array: { count: ports, stride: 4 }
+    fields: [ { name: val, width: 32, sw: rw, hw: r, reset: 0 } ]
+
   - name: rprefix
     offset: 0x100
     desc: route destination prefix
@@ -84,4 +91,9 @@ regs:
   - name: busycnt
     offset: 0x420
     desc: frames dropped because the port still held an unsent packet
+    fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
+
+  - name: arpcnt
+    offset: 0x424
+    desc: ARP requests for a port address answered
     fields: [ { name: val, width: 32, sw: r, hw: w, volatile: true } ]
