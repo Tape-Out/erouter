@@ -1,11 +1,14 @@
 package Erouter;
 
-// IPv4 路由核：每口一块帧缓冲，存储转发。收完一帧、FCS 对了，才查链路层、查头部（RFC 1812 5.2.2）、
+// IPv4 路由核：每口 frames 块帧缓冲，存储转发。收完一帧、FCS 对了，才查链路层、查头部（RFC 1812 5.2.2）、
 // 查 TTL、查路由表（最长前缀），然后把包挂到出口；出口边发边改写目的 MAC、源 MAC、TTL 与校验和，
 // FCS 由 RmiiTx 重算。头部结构、校验和、表项匹配在 Ipv4（BH），挑表项在 hwcore 的 Match（BH）。
 //
 // 不做直通：RmiiTx 会给转出去的帧重算一个正确的 FCS，直通就把输入端的坏帧洗成了好帧。
 // 同 eswitch：一条规则只调一次某个动作方法；入口、出口、计数各自一条规则，互相用线递消息。
+//
+// 一口有两块以上时前一帧在发、后一帧照收：同一口背靠背来的帧（TCP 一口气发的几段）不丢。入口按块轮流写，
+// 出口按先后发，同一入口的帧不乱序。
 //
 // 问本口 IP 的 ARP 请求就地答：请求留在入口的缓冲里，出口从原口发回时按位置改写成应答
 // （RFC 826）。主机要先解析网关的 MAC 才发得出第一个包，不答 ARP 就得在每台主机上手写静态表。
@@ -29,7 +32,8 @@ interface ErouterPins#(numeric type ports);
   interface Vector#(ports, RmiiRxPins) rx;
 endinterface
 
-interface ErouterIfc#(numeric type aw, numeric type dw, numeric type ports, numeric type routes, numeric type mtu);
+interface ErouterIfc#(numeric type aw, numeric type dw, numeric type ports, numeric type routes, numeric type mtu,
+                      numeric type frames);
   interface RegIf#(aw, dw) regs;
   interface ErouterPins#(ports) pins;
 endinterface
@@ -51,9 +55,9 @@ typedef enum { Taken, Routed, BadFcs, NotMine, BadHdr, Expired, NoRoute, TooLong
 function RmiiTxPins getTxPins(RmiiTxIfc i) = i.pins;
 function RmiiRxPins getRxPins(RmiiRxIfc i) = i.pins;
 
-module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
+module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu, frames))
     provisos (Mul#(TDiv#(dw, 8), 8, dw), Add#(_a, 12, aw), Add#(_b, 1, dw), Add#(_c, 16, dw),
-              Add#(_d, 32, dw), Add#(1, _e, routes), Add#(_f, TLog#(ports), 4));
+              Add#(_d, 32, dw), Add#(1, _e, routes), Add#(_f, TLog#(ports), 4), Add#(1, _g, frames));
 
   ErouterRegsIfc#(aw, dw, ports, routes) r <- mkErouterRegs;
 
@@ -62,8 +66,13 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
 
   Integer nport = valueOf(ports);
   Integer cap   = valueOf(mtu) + 4;   // 缓冲连 FCS 一起存，帧尾再去掉
+  Integer nf    = valueOf(frames);
 
-  Vector#(ports, RegFile#(UInt#(11), Bit#(8))) buff <- replicateM(mkRegFile(0, fromInteger(cap - 1)));
+  Vector#(ports, Vector#(frames, RegFile#(UInt#(11), Bit#(8)))) buff <-
+    replicateM(replicateM(mkRegFile(0, fromInteger(cap - 1))));
+  // 入口往 wr 那块收，出口发 rd 那块：两个指针各走各的，块里有没有包看 pend
+  Vector#(ports, Reg#(UInt#(TLog#(TAdd#(frames, 1))))) wr <- replicateM(mkReg(0));
+  Vector#(ports, Reg#(UInt#(TLog#(TAdd#(frames, 1))))) rd <- replicateM(mkReg(0));
 
   // ---- 每个入口的收帧状态 ----
   Vector#(ports, Reg#(UInt#(11)))   len     <- replicateM(mkReg(0));
@@ -74,14 +83,17 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
   Vector#(ports, Reg#(Bit#(8)))     hiB     <- replicateM(mkReg(0));
   Vector#(ports, Reg#(Bit#(4)))     ihl     <- replicateM(mkReg(0));
   Vector#(ports, Reg#(Bool))        tooLong <- replicateM(mkReg(False));
-  Vector#(ports, Reg#(Bool))        skip    <- replicateM(mkReg(False));  // 帧开头时口上还压着没发的包
+  Vector#(ports, Reg#(Bool))        skip    <- replicateM(mkReg(False));  // 帧开头时口上的块都压着没发的包
   // 入口挂包、出口发完清掉：清的规则写 0 口，入口写 1 口
-  Vector#(ports, Array#(Reg#(Maybe#(Pending)))) pend <- replicateM(mkCReg(2, tagged Invalid));
+  Vector#(ports, Vector#(frames, Array#(Reg#(Maybe#(Pending))))) pend <-
+    replicateM(replicateM(mkCReg(2, tagged Invalid)));
 
   // ---- 每个出口的发送状态 ----
   Vector#(ports, Reg#(Maybe#(UInt#(4)))) cur <- replicateM(mkReg(tagged Invalid));
   Vector#(ports, Reg#(UInt#(11)))        at  <- replicateM(mkReg(0));
   Vector#(ports, Reg#(UInt#(4)))         rr  <- replicateM(mkReg(0));
+  // 每个入口一路读出：正在发它的那个出口要的那个字节（见 fetch）
+  Vector#(ports, Wire#(Bit#(8)))         rdat <- replicateM(mkDWire(0));
 
   // 出口 q 发完入口 p 的包：每对一根脉冲线，谁也不跟谁抢写
   Vector#(ports, Vector#(ports, PulseWire)) done <- replicateM(replicateM(mkPulseWire));
@@ -99,16 +111,28 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
   endfunction
   Vector#(routes, Route) table_ = genWith(routeAt);
 
-  function Maybe#(Pending) held(Array#(Reg#(Maybe#(Pending))) a) = a[0];
+  function UInt#(TLog#(TAdd#(frames, 1))) nextOf(UInt#(TLog#(TAdd#(frames, 1))) s) =
+    s + 1 == fromInteger(nf) ? 0 : s + 1;
+
+  // 入口 p 下一个要发的包（rd 那块）
+  function Maybe#(Pending) held(Integer p);
+    Maybe#(Pending) m = tagged Invalid;
+    for (Integer s = 0; s < nf; s = s + 1) if (rd[p] == fromInteger(s)) m = pend[p][s][0];
+    return m;
+  endfunction
 
   for (Integer p = 0; p < nport; p = p + 1) begin
     rule ingress (r.ctrl_en == 1);
       let c <- rxp[p].rx.get;
       if (!c.last) begin
-        Bool sk = len[p] == 0 ? isValid(pend[p][1]) : skip[p];
+        Bool full = False;
+        for (Integer s = 0; s < nf; s = s + 1) if (wr[p] == fromInteger(s) && isValid(pend[p][s][1])) full = True;
+        Bool sk = len[p] == 0 ? full : skip[p];
         if (len[p] == 0) skip[p] <= sk;
         if (!sk) begin
-          if (len[p] < fromInteger(cap)) buff[p].upd(len[p], c.dat);
+          if (len[p] < fromInteger(cap)) begin
+            for (Integer s = 0; s < nf; s = s + 1) if (wr[p] == fromInteger(s)) buff[p][s].upd(len[p], c.dat);
+          end
           else tooLong[p] <= True;
           if (len[p] < 42) hv[p][len[p]] <= c.dat;
           // IP 头部的反码和，边收边算（RFC 1071）；IHL 在 IP 部分第一个字节里
@@ -158,26 +182,42 @@ module mkErouter#(ErouterCfg cfg)(ErouterIfc#(aw, dw, ports, routes, mtu))
                                       csum: ckUpdate(ip.csum, {ip.ttl, ip.proto}, {nt, ip.proto}),
                                       arp: False, spa: 0 };
         end else why = NoRoute;
-        if (isValid(np)) pend[p][1] <= np;
+        if (isValid(np)) begin
+          for (Integer s = 0; s < nf; s = s + 1) if (wr[p] == fromInteger(s)) pend[p][s][1] <= np;
+          wr[p] <= nextOf(wr[p]);
+        end
         ev[p].wset(why);
         len[p] <= 0; sum[p] <= 0; tooLong[p] <= False; skip[p] <= False;
       end
+    endrule
+
+    // 入口 p 下一个包只去一个出口，同一时刻只有那一个出口在发它：每块缓冲开一个读口，地址取那个出口的进度，
+    // 出口只在各入口的读出里挑。每个出口各开读口时，读选择器的面积与存储本身一样大
+    rule fetch;
+      UInt#(11) a = 0;
+      for (Integer q = 0; q < nport; q = q + 1)
+        if (cur[q] matches tagged Valid .x &&& x == fromInteger(p)) a = at[q];
+      Bit#(8) d = 0;
+      for (Integer s = 0; s < nf; s = s + 1) if (rd[p] == fromInteger(s)) d = buff[p][s].sub(a);
+      rdat[p] <= d;
     endrule
 
     // 发完的包从入口上摘掉
     rule clear;
       Bool any = False;
       for (Integer q = 0; q < nport; q = q + 1) if (done[q][p]) any = True;
-      if (any) pend[p][0] <= tagged Invalid;
+      if (any) begin
+        for (Integer s = 0; s < nf; s = s + 1) if (rd[p] == fromInteger(s)) pend[p][s][0] <= tagged Invalid;
+        rd[p] <= nextOf(rd[p]);
+      end
     endrule
   end
 
   for (Integer q = 0; q < nport; q = q + 1) begin
     rule egress (r.ctrl_en == 1);
-      Vector#(ports, Maybe#(Pending)) pv = map(held, pend);
+      Vector#(ports, Maybe#(Pending)) pv = genWith(held);
       UInt#(11) k = at[q];
-      Vector#(ports, Bit#(8)) bv = newVector;
-      for (Integer i = 0; i < nport; i = i + 1) bv[i] = buff[i].sub(k);
+      Vector#(ports, Bit#(8)) bv = readVReg(rdat);
       if (cur[q] matches tagged Valid .p) begin
         Pending t = fromMaybe(?, pv[p]);
         Vector#(6, Bit#(8)) nh  = unpack(t.nh);

@@ -13,7 +13,7 @@ bus-neutral contracts in [`hwcore`](https://github.com/Tape-Out/hwcore), assembl
 
 Simulated. The IP forwards IPv4 packets between `ports` RMII interfaces, using the receiver and transmitter from [`emac`](https://github.com/Tape-Out/emac).
 
-It is store-and-forward: each input keeps one frame in a buffer of `mtu` bytes and decides only when the whole frame is in and its FCS is good. A cut-through router would rewrite the header of a frame whose FCS it has not seen yet, and the output transmitter would then give that bad frame a new, valid FCS.
+It is store-and-forward: each input keeps up to `frames` frames, each in a buffer of `mtu` bytes, and decides only when the whole frame is in and its FCS is good. With two or more buffers a port receives the next frame while the previous one is still being sent, so frames that arrive back to back on one port, such as a burst of TCP segments, are kept; frames from one input leave in the order they came. A cut-through router would rewrite the header of a frame whose FCS it has not seen yet, and the output transmitter would then give that bad frame a new, valid FCS.
 
 A frame is accepted when its destination MAC is the input port's address and its EtherType is 0x0800. The header then goes through the five checks of RFC 1812 section 5.2.2, which cannot be switched off, plus a check that the header fits in the frame. A packet whose TTL is 0 or 1 is dropped; otherwise the TTL is decremented and the header checksum updated with RFC 1624 equation 3. The route table is searched for the longest matching prefix (RFC 1812 section 5.2.4.3); on a tie the lower entry wins. The output port rewrites the destination MAC to the route's next hop and the source MAC to its own address. Every dropped frame is counted by reason.
 
@@ -33,7 +33,7 @@ The testbench drives every port with an `RmiiTx` and watches every port with an 
 - two ports sending to the same output at once;
 - a packet whose updated checksum must be 0x0000, which equation 2 of RFC 1624 would give as 0xFFFF;
 - a frame of exactly `mtu` bytes forwarded and one byte more dropped;
-- a frame arriving while its port still holds an unsent packet, dropped and counted;
+- three frames back to back on one port: with one buffer the second, which arrives while the first is still being sent, is dropped and counted and the third is forwarded; with two or more all three are forwarded in order;
 - an ARP request for a port's address, sent to the broadcast address and to the port's own MAC, each answered from that port and compared with a reply built independently; a request for another address, an ARP reply, and a request on a port with no address, each dropped and counted as a link-layer drop.
 
 ## Registers
@@ -68,6 +68,7 @@ A MAC address is written with its first byte on the wire in the highest bits.
 | `ports` | 4 | 2–4 | RMII ports |
 | `routes` | 8 | 2–16 | route table entries |
 | `mtu` | 256 | 64–512 | frame buffer per port in bytes, FCS not included |
+| `frames` | 1 | 1–4 | frame buffers per port |
 
 Not implemented: ICMP (Time Exceeded, Destination Unreachable, Parameter Problem), ARP resolution (requests for a port's address are answered, but the router sends none, so next hop MACs are written into the route table), local delivery to the router's own addresses (it does not answer ping), fragmentation and per-port MTUs, IP options processing such as source routing, multicast and broadcast forwarding, IPv6, VLANs, routing by type of service, and output queues. Buffers are flip-flops, at roughly 90 µm² a byte, so `mtu` stops at 512: four full-size 1518-byte buffers would be larger than a whole reference SoC and need an SRAM macro instead.
 

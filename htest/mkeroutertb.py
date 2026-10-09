@@ -9,7 +9,7 @@
 测试台是一段小程序加一个解释器：每一步一拍（写寄存器、读计数器比对、起一帧、等），
 避开 StmtFSM 的展开步数上限；报错文字按步号挑，指得出是哪一条判据。
 
-认矩阵：`ports`、`routes`、`mtu` 从这一点的旋钮来。口数少于 4 时出口按口数取模，
+认矩阵：`ports`、`routes`、`mtu`、`frames` 从这一点的旋钮来。口数少于 4 时出口按口数取模，
 路由表只有两项时缺省路由暂占第二项、测完写回。
 """
 import json
@@ -25,6 +25,7 @@ k = cfg.get("knobs", {})
 P = int(k.get("ports", 4))
 R = int(k.get("routes", 8))
 M = int(k.get("mtu", 256))
+F = int(k.get("frames", 1))
 
 H = 44          # 帧的前 H 字节查表，之后的字节按 pat 公式，长帧不必整帧进表
 HOST = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55]
@@ -341,18 +342,21 @@ drop(0, frame(ip4(10, 2, 0, 1), n=M + 1), "longcnt")
 fwd(0, frame(ip4(10, 2, 0, 1), n=M), OA, "A")
 check()
 
-# 10：入口一次只存一帧：前一个包还没发完时背靠背来的第二帧丢弃计数
+# 10：同一口背靠背三帧。一块缓冲时第二帧到时第一帧还在发，丢弃计数；第三帧到时第一帧已发完，照转。
+# 两块时三帧都转出，次序不变
 case = "busy port"
-f1 = frame(ip4(10, 2, 0, 1))
-f2 = frame(ip4(10, 2, 0, 2))
-S(0, f1)
-Q()
-S(0, f2)
-settle(f1)
-CNT["rxcnt"] += 2
-CNT["fwdcnt"] += 1
-CNT["busycnt"] += 1
-EXP[OA].append(sig(forwarded(f1, OA, "A")))
+bb = [frame(ip4(10, 2, 0, 1 + i)) for i in range(3)]
+for i, f in enumerate(bb):
+    S(0, f)
+    if i < 2:
+        Q()
+settle(*bb)
+D(8 * (len(FR[bb[0]]) + 12))
+kept = bb if F > 1 else [bb[0], bb[2]]
+CNT["rxcnt"] += 3
+CNT["fwdcnt"] += len(kept)
+CNT["busycnt"] += 3 - len(kept)
+EXP[OA] += [sig(forwarded(f, OA, "A")) for f in kept]
 check()
 
 # 11：ARP（RFC 826）。问本口 IP 的请求从原口答回，改写成应答；问别的地址、已经是应答、本口没配 IP，
@@ -435,7 +439,7 @@ import RmiiRx::*;
 import Erouter::*;
 
 // 由 htest/mkeroutertb.py 生成，勿手改。
-// 这一点：ports={P} routes={R} mtu={M}
+// 这一点：ports={P} routes={R} mtu={M} frames={F}
 
 typedef struct {{
   Bit#(3)  op;
@@ -487,7 +491,7 @@ endfunction
 
 (* synthesize *)
 module mkErouter{label}Tb(Empty);
-  ErouterIfc#(12, 32, {P}, {R}, {M}) d <- mkErouter(ErouterCfg {{ none: 0 }});
+  ErouterIfc#(12, 32, {P}, {R}, {M}, {F}) d <- mkErouter(ErouterCfg {{ none: 0 }});
   Vector#({P}, RmiiTxIfc) gen <- replicateM(mkRmiiTx);
   Vector#({P}, RmiiRxIfc) mon <- replicateM(mkRmiiRx);
 
@@ -603,4 +607,4 @@ endpackage
 '''
 
 (out / f"Erouter{label}Tb.bsv").write_text(txt, encoding="utf-8")
-print(f"  erouter 行为测试台就位：ports={P} routes={R} mtu={M}，{len(OPS)} 步、{len(FR)} 帧")
+print(f"  erouter 行为测试台就位：ports={P} routes={R} mtu={M} frames={F}，{len(OPS)} 步、{len(FR)} 帧")
